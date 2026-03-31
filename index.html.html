@@ -1,0 +1,1064 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>학생 사안 공동 기록 시스템</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background:#f1f5f9; color:#0f172a; }
+    .card { border:1px solid #e2e8f0; background:white; border-radius:24px; box-shadow:0 1px 2px rgba(15,23,42,.05); }
+    .pill { display:inline-flex; align-items:center; border-radius:9999px; padding:4px 12px; font-size:12px; font-weight:600; }
+    .pill-slate { background:#f1f5f9; color:#475569; }
+    .pill-blue { background:#dbeafe; color:#1d4ed8; }
+    .pill-red { background:#fee2e2; color:#b91c1c; }
+    .pill-amber { background:#fef3c7; color:#b45309; }
+    .pill-green { background:#dcfce7; color:#15803d; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="module">
+    import React, { useEffect, useMemo, useState } from "https://esm.sh/react@18";
+    import { createRoot } from "https://esm.sh/react-dom@18/client";
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-app.js";
+    import {
+      getAuth,
+      GoogleAuthProvider,
+      signInWithPopup,
+      signOut,
+      onAuthStateChanged,
+    } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-auth.js";
+    import {
+      getFirestore,
+      collection,
+      addDoc,
+      doc,
+      getDoc,
+      getDocs,
+      updateDoc,
+      deleteDoc,
+      onSnapshot,
+      serverTimestamp,
+      query,
+      orderBy,
+      where,
+      limit,
+    } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
+
+    /**
+     * =========================================================
+     *  1. 여기만 바꾸면 되는 최소 설정
+     *  배포용 구조: 선생님 목록/학생 명단은 Firestore에서 읽음
+     * =========================================================
+     */
+    const FIREBASE_CONFIG = {
+      apiKey: "AIzaSyBtlfCHgDEwVGnBy8rFj3Byi4XYy8RsgVo",
+      authDomain: "student-incident-report-9d85e.firebaseapp.com",
+      projectId: "student-incident-report-9d85e",
+      storageBucket: "student-incident-report-9d85e.firebasestorage.app",
+      messagingSenderId: "846776891019",
+      appId: "1:846776891019:web:042ca5fc287f46357d068e",
+    };
+
+    /**
+     * Firestore 기본 구조
+     * settings/app                : 앱 기본 설정 1개 문서
+     * authorizedTeachers/{id}     : 허용된 교사 목록
+     * students/{id}               : 학생 목록
+     * incidents/{id}              : 사안 기록
+     */
+
+    const app = initializeApp(FIREBASE_CONFIG);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const provider = new GoogleAuthProvider();
+
+    const DEFAULT_SETTINGS = {
+      schoolName: "학교 이름 미설정",
+      schoolYearLabel: "3학년",
+      appTitle: "학생 사안 공동 기록 시스템",
+      subTitle: "Firebase 배포용 버전",
+      footerText: "deploy ready version",
+      placeOptions: ["교실", "복도", "운동장", "급식실", "특별실", "상담실", "교무실", "교외", "화장실", "기타"],
+      typeOptions: ["수업방해", "교우갈등", "언어폭력", "신체충돌", "무단이탈/지각", "생활규정위반", "정서/상담", "전자기기사용", "기타"],
+      severityOptions: ["낮음", "보통", "높음"],
+      statusOptions: ["진행중", "조치완료", "추적관찰"],
+    };
+
+    function safeLower(value) {
+      return String(value || "").trim().toLowerCase();
+    }
+
+    function nowText() {
+      return new Date().toLocaleString("sv-SE").slice(0, 16).replace("T", " ");
+    }
+
+    function getWeekKey(dateLike) {
+      const d = new Date(dateLike);
+      if (Number.isNaN(d.getTime())) return "기타";
+      const first = new Date(d.getFullYear(), 0, 1);
+      const diff = Math.floor((d - first) / 86400000);
+      const week = Math.ceil((diff + first.getDay() + 1) / 7);
+      return `${d.getFullYear()}-${String(week).padStart(2, "0")}주`;
+    }
+
+    function getLastNWeekKeys(n = 4) {
+      const result = [];
+      const now = new Date();
+      for (let i = n - 1; i >= 0; i--) {
+        const d = new Date(now);
+        d.setDate(now.getDate() - i * 7);
+        result.push(getWeekKey(d));
+      }
+      return result;
+    }
+
+    function getStudentTrendLabel(prevCount, recentCount) {
+      if (prevCount >= 2 && recentCount === 0) return "성장중";
+      if (recentCount > prevCount) return "주의";
+      if (recentCount < prevCount) return "개선";
+      return "유지";
+    }
+
+    function toggleListValue(value, list, setter) {
+      setter(list.includes(value) ? list.filter((v) => v !== value) : [...list, value]);
+    }
+
+    function Pill({ children, tone = "slate" }) {
+      return React.createElement("span", { className: `pill pill-${tone}` }, children);
+    }
+
+    function StatCard({ title, value, hint }) {
+      return React.createElement("div", { className: "card p-5" },
+        React.createElement("div", { className: "text-sm text-slate-500" }, title),
+        React.createElement("div", { className: "mt-2 text-3xl font-bold text-slate-900" }, value),
+        hint ? React.createElement("div", { className: "mt-2 text-xs text-slate-500" }, hint) : null,
+      );
+    }
+
+    function MiniBar({ label, value, max }) {
+      const width = max > 0 ? Math.max((value / max) * 100, value > 0 ? 10 : 0) : 0;
+      return React.createElement("div", { className: "space-y-1" },
+        React.createElement("div", { className: "flex items-center justify-between text-sm" },
+          React.createElement("span", null, label),
+          React.createElement("span", { className: "font-semibold" }, value),
+        ),
+        React.createElement("div", { className: "h-2 rounded-full bg-slate-100" },
+          React.createElement("div", {
+            className: "h-2 rounded-full bg-slate-700",
+            style: { width: `${width}%` },
+          })
+        )
+      );
+    }
+
+    function CheckboxGrid({ title, options, selected, onToggle }) {
+      return React.createElement("div", null,
+        React.createElement("div", { className: "mb-3 text-sm font-semibold text-slate-700" }, title),
+        React.createElement("div", { className: "grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4" },
+          ...options.map((opt) =>
+            React.createElement("label", {
+              key: opt,
+              className: "flex cursor-pointer items-center gap-2 rounded-2xl border border-slate-200 px-3 py-3 hover:bg-slate-50"
+            },
+              React.createElement("input", {
+                type: "checkbox",
+                checked: selected.includes(opt),
+                onChange: () => onToggle(opt),
+                className: "h-4 w-4",
+              }),
+              React.createElement("span", { className: "text-sm text-slate-700" }, opt),
+            )
+          )
+        )
+      );
+    }
+
+    function CommentBox({ incidentId, comments, onAddComment, onDeleteComment, onToggleLike, currentUserEmail, currentUserName }) {
+      const [text, setText] = useState("");
+
+      return React.createElement("div", { className: "mt-4 rounded-2xl border border-slate-200 bg-white p-4" },
+        React.createElement("div", { className: "mb-3 text-sm font-semibold text-slate-700" }, "지도방안 코멘트"),
+        React.createElement("div", { className: "space-y-2" },
+          ...(comments && comments.length
+            ? comments.map((c, idx) =>
+                React.createElement("div", { key: `${incidentId}-${idx}`, className: "rounded-2xl bg-slate-50 px-3 py-3" },
+                  React.createElement("div", { className: "flex items-start justify-between gap-3" },
+                    React.createElement("div", null,
+                      React.createElement("div", { className: "text-xs text-slate-500" },
+                        `${c.writer || "익명"} · ${c.createdAtText || ""}`
+                      )
+                    ),
+                    (c.writerEmail === currentUserEmail || c.writer === currentUserName)
+                      ? React.createElement("button", {
+                          onClick: async () => {
+                            const ok = window.confirm("이 코멘트를 삭제할까요?");
+                            if (!ok) return;
+                            await onDeleteComment(incidentId, idx);
+                          },
+                          className: "shrink-0 rounded-xl bg-red-50 px-3 py-1 text-xs font-medium text-red-600 hover:bg-red-100",
+                        }, "삭제")
+                      : null
+                  ),
+                  React.createElement("div", { className: "mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-700" }, c.text || ""),
+                  React.createElement("div", { className: "mt-2 flex items-center gap-2" },
+                    React.createElement("button", {
+                      onClick: async () => {
+                        await onToggleLike(incidentId, idx);
+                      },
+                      className: "flex items-center gap-1 rounded-xl bg-slate-100 px-3 py-1 text-xs hover:bg-slate-200",
+                    },
+                      "👍",
+                      React.createElement("span", null, (c.likes || []).length)
+                    )
+                  )
+                )
+              )
+            : [React.createElement("div", { key: "empty", className: "text-sm text-slate-400" }, "아직 등록된 코멘트가 없어요.")]
+          )
+        ),
+        React.createElement("div", { className: "mt-3 flex flex-col gap-2 md:flex-row" },
+          React.createElement("textarea", {
+            value: text,
+            onChange: (e) => setText(e.target.value),
+            placeholder: "지도방안, 관찰 의견, 협의 내용을 남겨주세요.",
+            className: "min-h-[90px] flex-1 rounded-2xl border border-slate-200 px-4 py-3 outline-none",
+          }),
+          React.createElement("button", {
+            onClick: async () => {
+              const trimmed = text.trim();
+              if (!trimmed) return;
+              await onAddComment(incidentId, trimmed);
+              setText("");
+            },
+            className: "rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white md:self-end",
+          }, "코멘트 등록")
+        )
+      );
+    }
+
+    function App() {
+      const [view, setView] = useState("dashboard");
+      const [authUser, setAuthUser] = useState(null);
+      const [teacherProfile, setTeacherProfile] = useState(null);
+      const [schoolSettings, setSchoolSettings] = useState(DEFAULT_SETTINGS);
+      const [students, setStudents] = useState([]);
+      const [incidents, setIncidents] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [queryText, setQueryText] = useState("");
+      const [studentQuery, setStudentQuery] = useState("");
+      const [selectedStudents, setSelectedStudents] = useState([]);
+      const [places, setPlaces] = useState([]);
+      const [types, setTypes] = useState([]);
+      const [editingId, setEditingId] = useState(null);
+      const [notice, setNotice] = useState("");
+
+      const [form, setForm] = useState({
+        datetime: "",
+        severity: "보통",
+        status: "진행중",
+        description: "",
+        followUp: "",
+        note: "",
+      });
+
+      useEffect(() => {
+        return onAuthStateChanged(auth, async (user) => {
+          setAuthUser(user);
+
+          if (!user) {
+            setTeacherProfile(null);
+            setLoading(false);
+            return;
+          }
+
+          try {
+            const email = safeLower(user.email);
+            const teacherQuery = query(
+              collection(db, "authorizedTeachers"),
+              where("email", "==", email),
+              where("active", "==", true),
+              limit(1)
+            );
+            const teacherSnap = await getDocs(teacherQuery);
+
+            if (teacherSnap.empty) {
+              setTeacherProfile(null);
+            } else {
+              const teacherDoc = teacherSnap.docs[0];
+              setTeacherProfile({ id: teacherDoc.id, ...teacherDoc.data() });
+            }
+          } catch (error) {
+            console.error(error);
+            setTeacherProfile(null);
+          }
+
+          setLoading(false);
+        });
+      }, []);
+
+      useEffect(() => {
+        let unsubStudents = null;
+        let unsubIncidents = null;
+
+        async function loadBaseData() {
+          if (!teacherProfile) return;
+
+          try {
+            const settingsRef = doc(db, "settings", "app");
+            const settingsSnap = await getDoc(settingsRef);
+            if (settingsSnap.exists()) {
+              setSchoolSettings({ ...DEFAULT_SETTINGS, ...settingsSnap.data() });
+            } else {
+              setSchoolSettings(DEFAULT_SETTINGS);
+            }
+
+            const studentsQuery = query(collection(db, "students"), orderBy("displayName", "asc"));
+            unsubStudents = onSnapshot(studentsQuery, (snapshot) => {
+              const rows = snapshot.docs
+                .map((d) => ({ id: d.id, ...d.data() }))
+                .filter((row) => row.active !== false);
+              setStudents(rows);
+            });
+
+            const incidentsQuery = query(collection(db, "incidents"), orderBy("datetime", "desc"));
+            unsubIncidents = onSnapshot(incidentsQuery, (snapshot) => {
+              const rows = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+              setIncidents(rows);
+            });
+          } catch (error) {
+            console.error(error);
+            setNotice("초기 데이터를 불러오는 중 오류가 발생했어요.");
+          }
+        }
+
+        loadBaseData();
+
+        return () => {
+          if (unsubStudents) unsubStudents();
+          if (unsubIncidents) unsubIncidents();
+        };
+      }, [teacherProfile]);
+
+      useEffect(() => {
+        setForm((prev) => ({
+          ...prev,
+          severity: schoolSettings.severityOptions?.[1] || schoolSettings.severityOptions?.[0] || "보통",
+          status: schoolSettings.statusOptions?.[0] || "진행중",
+        }));
+      }, [schoolSettings.severityOptions, schoolSettings.statusOptions]);
+
+      useEffect(() => {
+        if (!notice) return;
+        const timer = setTimeout(() => setNotice(""), 1800);
+        return () => clearTimeout(timer);
+      }, [notice]);
+
+      const filteredRoster = useMemo(() => {
+        const source = students.map((student) => student.displayName).filter(Boolean);
+        if (!studentQuery.trim()) return source;
+        const q = studentQuery.trim().toLowerCase();
+        return source.filter((student) => String(student).toLowerCase().includes(q));
+      }, [students, studentQuery]);
+
+      const filteredIncidents = useMemo(() => {
+        if (!queryText.trim()) return incidents;
+        const q = queryText.toLowerCase();
+        return incidents.filter((item) => {
+          const merged = [
+            item.id,
+            item.datetime,
+            item.severity,
+            item.status,
+            item.description,
+            item.followUp,
+            item.note || "",
+            ...(item.places || []),
+            ...(item.types || []),
+            ...(item.students || []),
+            ...(item.writers || []),
+          ].join(" ").toLowerCase();
+          return merged.includes(q);
+        });
+      }, [incidents, queryText]);
+
+      const countsByStudent = useMemo(() => {
+        const map = {};
+        incidents.forEach((incident) => {
+          (incident.students || []).forEach((student) => {
+            map[student] = (map[student] || 0) + 1;
+          });
+        });
+        return Object.entries(map)
+          .map(([name, count]) => ({ name, count }))
+          .sort((a, b) => b.count - a.count);
+      }, [incidents]);
+
+      const countsByType = useMemo(() => {
+        const map = {};
+        (schoolSettings.typeOptions || []).forEach((type) => { map[type] = 0; });
+        incidents.forEach((incident) => {
+          (incident.types || []).forEach((type) => {
+            map[type] = (map[type] || 0) + 1;
+          });
+        });
+        return Object.entries(map)
+          .map(([name, count]) => ({ name, count }))
+          .sort((a, b) => b.count - a.count);
+      }, [incidents, schoolSettings.typeOptions]);
+
+      const totalCount = incidents.length;
+      const inProgressCount = incidents.filter((i) => i.status === "진행중").length;
+      const highCount = incidents.filter((i) => i.severity === "높음").length;
+      const recentWeekKeys = useMemo(() => getLastNWeekKeys(4), []);
+
+      const weeklyTrend = useMemo(() => {
+        const base = {};
+        recentWeekKeys.forEach((key) => { base[key] = 0; });
+        incidents.forEach((incident) => {
+          const key = getWeekKey(incident.datetime);
+          if (base[key] !== undefined) base[key] += 1;
+        });
+        return recentWeekKeys.map((key) => ({ key, count: base[key] || 0 }));
+      }, [incidents, recentWeekKeys]);
+
+      const weeklyMax = Math.max(...weeklyTrend.map((row) => row.count), 1);
+      const completionRate = totalCount ? Math.round((incidents.filter((i) => i.status === "조치완료").length / totalCount) * 100) : 0;
+      const highRiskRate = totalCount ? Math.round((highCount / totalCount) * 100) : 0;
+
+      const growthStats = useMemo(() => {
+        const now = new Date();
+        const recentStart = new Date(now);
+        recentStart.setDate(now.getDate() - 14);
+        const prevStart = new Date(now);
+        prevStart.setDate(now.getDate() - 28);
+
+        const recentMap = {};
+        const prevMap = {};
+
+        incidents.forEach((incident) => {
+          const incidentDate = new Date(incident.datetime);
+          const listedStudents = incident.students || [];
+          listedStudents.forEach((student) => {
+            if (incidentDate >= recentStart) recentMap[student] = (recentMap[student] || 0) + 1;
+            else if (incidentDate >= prevStart && incidentDate < recentStart) prevMap[student] = (prevMap[student] || 0) + 1;
+          });
+        });
+
+        const mergedStudents = Array.from(new Set([...Object.keys(recentMap), ...Object.keys(prevMap)]));
+        return mergedStudents.map((student) => {
+          const prevCount = prevMap[student] || 0;
+          const recentCount = recentMap[student] || 0;
+          return {
+            student,
+            prevCount,
+            recentCount,
+            label: getStudentTrendLabel(prevCount, recentCount),
+          };
+        }).sort((a, b) => b.recentCount - a.recentCount);
+      }, [incidents]);
+
+      const growthStudents = growthStats.filter((x) => x.label === "성장중" || x.label === "개선").slice(0, 6);
+      const warningStudents = growthStats.filter((x) => x.label === "주의").slice(0, 6);
+
+      function resetForm() {
+        setForm({
+          datetime: "",
+          severity: schoolSettings.severityOptions?.[1] || schoolSettings.severityOptions?.[0] || "보통",
+          status: schoolSettings.statusOptions?.[0] || "진행중",
+          description: "",
+          followUp: "",
+          note: "",
+        });
+        setSelectedStudents([]);
+        setPlaces([]);
+        setTypes([]);
+        setStudentQuery("");
+        setEditingId(null);
+      }
+
+      function startEdit(incident) {
+        setEditingId(incident.id);
+        setForm({
+          datetime: incident.datetime || "",
+          severity: incident.severity || (schoolSettings.severityOptions?.[1] || "보통"),
+          status: incident.status || (schoolSettings.statusOptions?.[0] || "진행중"),
+          description: incident.description || "",
+          followUp: incident.followUp || "",
+          note: incident.note || "",
+        });
+        setSelectedStudents(incident.students || []);
+        setPlaces(incident.places || []);
+        setTypes(incident.types || []);
+        setView("create");
+        setNotice("사안을 수정 모드로 불러왔어요.");
+      }
+
+      async function signIn() {
+        try {
+          await signInWithPopup(auth, provider);
+        } catch (error) {
+          console.error(error);
+          setNotice("로그인에 실패했어요.");
+        }
+      }
+
+      async function logOut() {
+        await signOut(auth);
+        setTeacherProfile(null);
+      }
+
+      function validateForm() {
+        if (!form.datetime) return "사안발생일시를 입력해 주세요.";
+        if (!places.length) return "사안발생장소를 1개 이상 선택해 주세요.";
+        if (!types.length) return "사안유형을 1개 이상 선택해 주세요.";
+        if (!selectedStudents.length) return "관련 학생을 1명 이상 선택해 주세요.";
+        if (!form.description.trim()) return "구체적 상황을 입력해 주세요.";
+        if (!form.followUp.trim()) return "후속조치를 입력해 주세요.";
+        return "";
+      }
+
+      async function saveIncident() {
+        const errorMessage = validateForm();
+        if (errorMessage) {
+          setNotice(errorMessage);
+          return;
+        }
+
+        const previous = incidents.find((x) => x.id === editingId);
+        const payload = {
+          datetime: form.datetime,
+          places,
+          types,
+          students: selectedStudents,
+          severity: form.severity,
+          status: form.status,
+          description: form.description.trim(),
+          followUp: form.followUp.trim(),
+          note: form.note.trim(),
+          writers: editingId
+            ? Array.from(new Set([...(previous?.writers || []), teacherProfile.name]))
+            : [teacherProfile.name],
+          updatedAt: serverTimestamp(),
+          updatedAtText: nowText(),
+        };
+
+        try {
+          if (editingId) {
+            await updateDoc(doc(db, "incidents", editingId), payload);
+            setNotice("사안을 수정했어요.");
+          } else {
+            await addDoc(collection(db, "incidents"), {
+              ...payload,
+              comments: [],
+              createdByEmail: safeLower(authUser?.email),
+              createdByName: teacherProfile.name || authUser?.displayName || "교사",
+              createdAt: serverTimestamp(),
+            });
+            setNotice("사안을 등록했어요.");
+          }
+          resetForm();
+          setView("incidents");
+        } catch (error) {
+          console.error(error);
+          setNotice("저장 중 오류가 발생했어요.");
+        }
+      }
+
+      async function deleteIncident(incidentId) {
+        const ok = window.confirm("이 사안을 정말 삭제할까요? 삭제 후 복구가 어려울 수 있어요.");
+        if (!ok) return;
+
+        try {
+          await deleteDoc(doc(db, "incidents", incidentId));
+          if (editingId === incidentId) resetForm();
+          setNotice("사안을 삭제했어요.");
+        } catch (error) {
+          console.error(error);
+          setNotice("삭제 중 오류가 발생했어요.");
+        }
+      }
+
+      async function addCommentToIncident(incidentId, text) {
+        const incident = incidents.find((x) => x.id === incidentId);
+        if (!incident) return;
+
+        const nextComments = [
+          ...(incident.comments || []),
+          {
+            writer: teacherProfile?.name || authUser?.displayName || "교사",
+            writerEmail: safeLower(authUser?.email),
+            text,
+            likes: [],
+            createdAtText: nowText(),
+          }
+        ];
+
+        try {
+          await updateDoc(doc(db, "incidents", incidentId), {
+            comments: nextComments,
+            updatedAt: serverTimestamp(),
+            updatedAtText: nowText(),
+          });
+          setNotice("코멘트를 등록했어요.");
+        } catch (error) {
+          console.error(error);
+          setNotice("코멘트 등록 중 오류가 발생했어요.");
+        }
+      }
+
+      async function deleteCommentFromIncident(incidentId, commentIndex) {
+        const incident = incidents.find((x) => x.id === incidentId);
+        if (!incident) return;
+
+        const nextComments = (incident.comments || []).filter((_, idx) => idx !== commentIndex);
+
+        try {
+          await updateDoc(doc(db, "incidents", incidentId), {
+            comments: nextComments,
+            updatedAt: serverTimestamp(),
+            updatedAtText: nowText(),
+          });
+          setNotice("코멘트를 삭제했어요.");
+        } catch (error) {
+          console.error(error);
+          setNotice("코멘트 삭제 중 오류가 발생했어요.");
+        }
+      }
+
+      async function toggleCommentLike(incidentId, commentIndex) {
+        const incident = incidents.find((x) => x.id === incidentId);
+        if (!incident) return;
+
+        const email = safeLower(authUser?.email);
+        if (!email) return;
+
+        const nextComments = [...(incident.comments || [])];
+        const target = nextComments[commentIndex];
+        if (!target) return;
+
+        const likes = Array.isArray(target.likes) ? target.likes : [];
+        const alreadyLiked = likes.includes(email);
+        target.likes = alreadyLiked ? likes.filter((v) => v !== email) : [...likes, email];
+
+        try {
+          await updateDoc(doc(db, "incidents", incidentId), {
+            comments: nextComments,
+            updatedAt: serverTimestamp(),
+            updatedAtText: nowText(),
+          });
+        } catch (error) {
+          console.error(error);
+          setNotice("좋아요 처리 중 오류가 발생했어요.");
+        }
+      }
+
+      async function seedDemoData() {
+        try {
+          const snap = await getDocs(query(collection(db, "incidents"), limit(1)));
+          if (!snap.empty) {
+            setNotice("이미 데이터가 있어서 예시 사안을 추가하지 않았어요.");
+            return;
+          }
+
+          const firstStudent = students[0]?.displayName || "3-1 예시학생";
+          await addDoc(collection(db, "incidents"), {
+            datetime: new Date().toISOString().slice(0, 16),
+            places: [schoolSettings.placeOptions?.[0] || "교실"],
+            types: [schoolSettings.typeOptions?.[0] || "수업방해"],
+            students: [firstStudent],
+            severity: schoolSettings.severityOptions?.[1] || "보통",
+            status: schoolSettings.statusOptions?.[0] || "진행중",
+            description: "예시 사안입니다.",
+            followUp: "예시 후속조치입니다.",
+            note: "",
+            writers: [teacherProfile.name],
+            comments: [],
+            createdByEmail: safeLower(authUser?.email),
+            createdByName: teacherProfile.name || authUser?.displayName || "교사",
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+            updatedAtText: nowText(),
+          });
+          setNotice("예시 사안을 추가했어요.");
+        } catch (error) {
+          console.error(error);
+          setNotice("예시 사안 추가 중 오류가 발생했어요.");
+        }
+      }
+
+      if (loading) {
+        return React.createElement("div", { className: "min-h-screen flex items-center justify-center text-slate-600" }, "불러오는 중...");
+      }
+
+      if (!authUser) {
+        return React.createElement("div", { className: "min-h-screen flex items-center justify-center p-6" },
+          React.createElement("div", { className: "card max-w-xl p-8 text-center" },
+            React.createElement("div", { className: "text-2xl font-bold text-slate-900" }, `${schoolSettings.schoolYearLabel} ${schoolSettings.appTitle}`),
+            React.createElement("p", { className: "mt-3 text-sm leading-7 text-slate-600" },
+              "Google 로그인 후, Firebase에 등록된 허용 교사만 사용할 수 있어요."
+            ),
+            React.createElement("button", {
+              onClick: signIn,
+              className: "mt-6 rounded-2xl bg-slate-900 px-5 py-3 text-sm font-medium text-white",
+            }, "Google로 로그인")
+          )
+        );
+      }
+
+      if (!teacherProfile) {
+        return React.createElement("div", { className: "min-h-screen flex items-center justify-center p-6" },
+          React.createElement("div", { className: "card max-w-xl p-8 text-center" },
+            React.createElement("div", { className: "text-xl font-bold text-slate-900" }, "허용된 교사 계정이 아니에요"),
+            React.createElement("p", { className: "mt-3 text-sm leading-7 text-slate-600" },
+              `현재 로그인: ${authUser.displayName || ""} / ${authUser.email || ""}`
+            ),
+            React.createElement("p", { className: "mt-2 text-sm leading-7 text-slate-600" },
+              "이 이메일이 Firestore의 authorizedTeachers 컬렉션에 active:true로 등록되어 있어야 들어올 수 있어요."
+            ),
+            React.createElement("button", {
+              onClick: logOut,
+              className: "mt-6 rounded-2xl bg-slate-900 px-5 py-3 text-sm font-medium text-white",
+            }, "로그아웃")
+          )
+        );
+      }
+
+      return React.createElement("div", { className: "min-h-screen bg-slate-100 text-slate-900" },
+        React.createElement("div", { className: "mx-auto max-w-7xl p-4 md:p-8" },
+          React.createElement("div", { className: "mb-6 rounded-[28px] bg-gradient-to-r from-slate-900 to-slate-700 p-6 text-white shadow-lg" },
+            React.createElement("div", { className: "flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between" },
+              React.createElement("div", null,
+                React.createElement("div", { className: "text-sm text-slate-200" }, schoolSettings.subTitle || "Firebase 배포용 버전"),
+                React.createElement("h1", { className: "mt-2 text-2xl font-bold md:text-3xl" }, `${schoolSettings.schoolYearLabel} ${schoolSettings.appTitle}`),
+                React.createElement("p", { className: "mt-2 text-sm text-slate-200" }, `${schoolSettings.schoolName} · ${teacherProfile.name} · ${teacherProfile.role || "교사"}`)
+              ),
+              React.createElement("div", { className: "flex flex-wrap items-center gap-3" },
+                React.createElement("button", {
+                  onClick: seedDemoData,
+                  className: "rounded-2xl bg-white/10 px-4 py-3 text-sm font-medium text-white",
+                }, "예시 사안 추가"),
+                React.createElement("button", {
+                  onClick: logOut,
+                  className: "rounded-2xl bg-white px-4 py-3 text-sm font-medium text-slate-900",
+                }, "로그아웃")
+              )
+            )
+          ),
+
+          notice ? React.createElement("div", { className: "mb-4 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-700" }, notice) : null,
+
+          React.createElement("div", { className: "mb-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4" },
+            React.createElement(StatCard, { title: "전체 사안 수", value: totalCount, hint: "실시간 공유 데이터" }),
+            React.createElement(StatCard, { title: "진행중 사안", value: inProgressCount, hint: "즉시 확인이 필요한 건" }),
+            React.createElement(StatCard, { title: "조치완료율", value: `${completionRate}%`, hint: "전체 대비 처리 완료 비율" }),
+            React.createElement(StatCard, { title: "고심각도 비율", value: `${highRiskRate}%`, hint: "높음 심각도 비중" }),
+          ),
+
+          React.createElement("div", { className: "mb-6 flex flex-wrap gap-2" },
+            ...[["dashboard", "대시보드"], ["incidents", "사안 목록"], ["create", editingId ? "사안 수정" : "사안 등록"]].map(([key, label]) =>
+              React.createElement("button", {
+                key,
+                onClick: () => setView(key),
+                className: `rounded-2xl px-4 py-3 text-sm font-medium ${view === key ? "bg-slate-900 text-white" : "bg-white text-slate-700 shadow-sm"}`,
+              }, label)
+            )
+          ),
+
+          view === "dashboard" ? React.createElement("div", { className: "space-y-6" },
+            React.createElement("div", { className: "grid gap-6 lg:grid-cols-2" },
+              React.createElement("div", { className: "card p-5" },
+                React.createElement("div", { className: "mb-4 text-lg font-semibold" }, "최근 4주 사안 추세"),
+                React.createElement("div", { className: "space-y-4" },
+                  ...weeklyTrend.map((row) => React.createElement(MiniBar, {
+                    key: row.key,
+                    label: row.key,
+                    value: row.count,
+                    max: weeklyMax,
+                  }))
+                )
+              ),
+              React.createElement("div", { className: "card p-5" },
+                React.createElement("div", { className: "mb-4 text-lg font-semibold" }, "사안 유형별 통계"),
+                React.createElement("div", { className: "space-y-3" },
+                  ...countsByType.map((type) => React.createElement(MiniBar, {
+                    key: type.name,
+                    label: type.name,
+                    value: type.count,
+                    max: Math.max(...countsByType.map((x) => x.count), 1),
+                  }))
+                )
+              )
+            ),
+            React.createElement("div", { className: "grid gap-6 lg:grid-cols-3" },
+              React.createElement("div", { className: "card p-5" },
+                React.createElement("div", { className: "mb-4 text-lg font-semibold" }, "반복 등장 학생"),
+                React.createElement("div", { className: "space-y-3" },
+                  ...(countsByStudent.slice(0, 8).length
+                    ? countsByStudent.slice(0, 8).map((student) =>
+                        React.createElement("div", { key: student.name, className: "flex items-center justify-between rounded-2xl bg-slate-50 px-4 py-3" },
+                          React.createElement("div", { className: "text-sm font-medium text-slate-700" }, student.name),
+                          React.createElement(Pill, { tone: student.count >= 3 ? "red" : student.count >= 2 ? "amber" : "blue" }, `${student.count}건`)
+                        )
+                      )
+                    : [React.createElement("div", { key: "empty-repeat", className: "text-sm text-slate-400" }, "표시할 학생이 없어요.")])
+                )
+              ),
+              React.createElement("div", { className: "card p-5" },
+                React.createElement("div", { className: "mb-4 text-lg font-semibold" }, "성장/개선 학생"),
+                React.createElement("div", { className: "space-y-3" },
+                  ...(growthStudents.length
+                    ? growthStudents.map((row) =>
+                        React.createElement("div", { key: row.student, className: "rounded-2xl bg-green-50 px-4 py-3" },
+                          React.createElement("div", { className: "flex items-center justify-between" },
+                            React.createElement("div", { className: "text-sm font-medium text-slate-800" }, row.student),
+                            React.createElement(Pill, { tone: "green" }, row.label)
+                          ),
+                          React.createElement("div", { className: "mt-1 text-xs text-slate-500" }, `이전 2주 ${row.prevCount}건 → 최근 2주 ${row.recentCount}건`)
+                        )
+                      )
+                    : [React.createElement("div", { key: "empty-growth", className: "text-sm text-slate-400" }, "표시할 학생이 없어요.")])
+                )
+              ),
+              React.createElement("div", { className: "card p-5" },
+                React.createElement("div", { className: "mb-4 text-lg font-semibold" }, "주의 학생"),
+                React.createElement("div", { className: "space-y-3" },
+                  ...(warningStudents.length
+                    ? warningStudents.map((row) =>
+                        React.createElement("div", { key: row.student, className: "rounded-2xl bg-red-50 px-4 py-3" },
+                          React.createElement("div", { className: "flex items-center justify-between" },
+                            React.createElement("div", { className: "text-sm font-medium text-slate-800" }, row.student),
+                            React.createElement(Pill, { tone: "red" }, row.label)
+                          ),
+                          React.createElement("div", { className: "mt-1 text-xs text-slate-500" }, `이전 2주 ${row.prevCount}건 → 최근 2주 ${row.recentCount}건`)
+                        )
+                      )
+                    : [React.createElement("div", { key: "empty-warning", className: "text-sm text-slate-400" }, "표시할 학생이 없어요.")])
+                )
+              )
+            )
+          ) : null,
+
+          view === "incidents" ? React.createElement("div", { className: "space-y-4" },
+            React.createElement("div", { className: "card p-4" },
+              React.createElement("div", { className: "flex flex-col gap-3 md:flex-row md:items-center md:justify-between" },
+                React.createElement("input", {
+                  value: queryText,
+                  onChange: (e) => setQueryText(e.target.value),
+                  placeholder: "학생명, 장소, 유형, 상태, 내용으로 검색",
+                  className: "w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none md:max-w-md",
+                }),
+                React.createElement("button", {
+                  onClick: () => { resetForm(); setView("create"); },
+                  className: "rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white",
+                }, "새 사안 등록")
+              )
+            ),
+            ...(filteredIncidents.length
+              ? filteredIncidents.map((item) => {
+                  const repeatedInThisIncident = (item.students || []).filter((student) => (countsByStudent.find((s) => s.name === student)?.count || 0) >= 2);
+                  return React.createElement("div", { key: item.id, className: "card p-5" },
+                    React.createElement("div", { className: "flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between" },
+                      React.createElement("div", { className: "flex-1" },
+                        React.createElement("div", { className: "flex flex-wrap items-center gap-2" },
+                          React.createElement(Pill, null, item.id),
+                          React.createElement(Pill, { tone: item.severity === "높음" ? "red" : item.severity === "보통" ? "amber" : "green" }, item.severity),
+                          React.createElement(Pill, { tone: "blue" }, item.status),
+                          React.createElement("span", { className: "text-sm text-slate-500" }, String(item.datetime || "").replace("T", " "))
+                        ),
+                        React.createElement("div", { className: "mt-3 flex flex-wrap gap-2" },
+                          ...(item.places || []).map((place) => React.createElement(Pill, { key: place, tone: "slate" }, `📍 ${place}`)),
+                          ...(item.types || []).map((type) => React.createElement(Pill, { key: type, tone: "blue" }, `🏷 ${type}`))
+                        ),
+                        React.createElement("div", { className: "mt-4" },
+                          React.createElement("div", { className: "mb-2 text-sm font-semibold text-slate-700" }, "관련 학생"),
+                          React.createElement("div", { className: "flex flex-wrap gap-2" },
+                            ...(item.students || []).map((student) => {
+                              const count = countsByStudent.find((s) => s.name === student)?.count || 0;
+                              return React.createElement(Pill, { key: student, tone: count >= 3 ? "red" : count >= 2 ? "amber" : "slate" }, student);
+                            })
+                          ),
+                          repeatedInThisIncident.length > 0
+                            ? React.createElement("div", { className: "mt-2 text-xs text-red-600" }, `반복 등장 학생: ${repeatedInThisIncident.join(", ")}`)
+                            : null
+                        )
+                      ),
+                      React.createElement("div", { className: "flex gap-2" },
+                        React.createElement("button", {
+                          onClick: () => startEdit(item),
+                          className: "rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white",
+                        }, "수정"),
+                        React.createElement("button", {
+                          onClick: () => deleteIncident(item.id),
+                          className: "rounded-2xl bg-red-600 px-4 py-3 text-sm font-medium text-white",
+                        }, "삭제")
+                      )
+                    ),
+                    React.createElement("div", { className: "mt-4 grid gap-4 lg:grid-cols-2" },
+                      React.createElement("div", { className: "rounded-2xl bg-slate-50 p-4" },
+                        React.createElement("div", { className: "mb-2 text-sm font-semibold text-slate-700" }, "구체적 상황"),
+                        React.createElement("div", { className: "whitespace-pre-wrap text-sm leading-7 text-slate-600" }, item.description || "")
+                      ),
+                      React.createElement("div", { className: "rounded-2xl bg-slate-50 p-4" },
+                        React.createElement("div", { className: "mb-2 text-sm font-semibold text-slate-700" }, "후속조치"),
+                        React.createElement("div", { className: "whitespace-pre-wrap text-sm leading-7 text-slate-600" }, item.followUp || "")
+                      )
+                    ),
+                    item.note
+                      ? React.createElement("div", { className: "mt-4 rounded-2xl bg-amber-50 p-4" },
+                          React.createElement("div", { className: "mb-2 text-sm font-semibold text-amber-800" }, "비고"),
+                          React.createElement("div", { className: "whitespace-pre-wrap text-sm leading-7 text-amber-900" }, item.note)
+                        )
+                      : null,
+                    React.createElement("div", { className: "mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-500" },
+                      React.createElement("span", null, `작성/추가 교사: ${(item.writers || []).join(", ")}`),
+                      React.createElement("span", null, `최근 수정일: ${item.updatedAtText || ""}`)
+                    ),
+                    React.createElement(CommentBox, {
+                      incidentId: item.id,
+                      comments: item.comments || [],
+                      onAddComment: addCommentToIncident,
+                      onDeleteComment: deleteCommentFromIncident,
+                      onToggleLike: toggleCommentLike,
+                      currentUserEmail: safeLower(authUser?.email),
+                      currentUserName: teacherProfile?.name || authUser?.displayName || "",
+                    })
+                  );
+                })
+              : [React.createElement("div", { key: "empty-incidents", className: "card p-6 text-sm text-slate-500" }, "조건에 맞는 사안이 없어요.")]
+            )
+          ) : null,
+
+          view === "create" ? React.createElement("div", { className: "card p-5 md:p-6" },
+            React.createElement("div", { className: "mb-5 text-xl font-bold" }, editingId ? "사안 수정" : "사안 등록"),
+            React.createElement("div", { className: "grid gap-4 md:grid-cols-3" },
+              React.createElement("div", null,
+                React.createElement("div", { className: "mb-2 text-sm font-semibold text-slate-700" }, "사안발생일시(시간까지 입력)"),
+                React.createElement("input", {
+                  type: "datetime-local",
+                  value: form.datetime,
+                  onChange: (e) => setForm({ ...form, datetime: e.target.value }),
+                  className: "w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none",
+                })
+              ),
+              React.createElement("div", null,
+                React.createElement("div", { className: "mb-2 text-sm font-semibold text-slate-700" }, "심각도"),
+                React.createElement("select", {
+                  value: form.severity,
+                  onChange: (e) => setForm({ ...form, severity: e.target.value }),
+                  className: "w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none",
+                },
+                  ...(schoolSettings.severityOptions || []).map((option) => React.createElement("option", { key: option, value: option }, option))
+                )
+              ),
+              React.createElement("div", null,
+                React.createElement("div", { className: "mb-2 text-sm font-semibold text-slate-700" }, "사안 상태"),
+                React.createElement("select", {
+                  value: form.status,
+                  onChange: (e) => setForm({ ...form, status: e.target.value }),
+                  className: "w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none",
+                },
+                  ...(schoolSettings.statusOptions || []).map((option) => React.createElement("option", { key: option, value: option }, option))
+                )
+              )
+            ),
+
+            React.createElement("div", { className: "mt-6 grid gap-6 xl:grid-cols-2" },
+              React.createElement(CheckboxGrid, {
+                title: "사안발생장소 · 복수 선택",
+                options: schoolSettings.placeOptions || [],
+                selected: places,
+                onToggle: (value) => toggleListValue(value, places, setPlaces),
+              }),
+              React.createElement(CheckboxGrid, {
+                title: "사안유형 · 복수 선택",
+                options: schoolSettings.typeOptions || [],
+                selected: types,
+                onToggle: (value) => toggleListValue(value, types, setTypes),
+              })
+            ),
+
+            React.createElement("div", { className: "mt-6" },
+              React.createElement("div", { className: "mb-2 flex items-center justify-between" },
+                React.createElement("div", { className: "text-sm font-semibold text-slate-700" }, "관련 학생 · 검색 후 여러 명 선택"),
+                React.createElement(Pill, { tone: "blue" }, `${selectedStudents.length}명 선택`)
+              ),
+              React.createElement("input", {
+                value: studentQuery,
+                onChange: (e) => setStudentQuery(e.target.value),
+                placeholder: "학생명 검색",
+                className: "mb-3 w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none md:max-w-md",
+              }),
+              React.createElement("div", { className: "max-h-64 overflow-auto rounded-2xl border border-slate-200 bg-slate-50 p-3" },
+                React.createElement("div", { className: "grid gap-2 md:grid-cols-2 xl:grid-cols-3" },
+                  ...filteredRoster.map((student) =>
+                    React.createElement("label", {
+                      key: student,
+                      className: "flex cursor-pointer items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-3 hover:bg-slate-50",
+                    },
+                      React.createElement("input", {
+                        type: "checkbox",
+                        checked: selectedStudents.includes(student),
+                        onChange: () => toggleListValue(student, selectedStudents, setSelectedStudents),
+                      }),
+                      React.createElement("span", { className: "text-sm text-slate-700" }, student)
+                    )
+                  )
+                )
+              )
+            ),
+
+            React.createElement("div", { className: "mt-6 grid gap-6 lg:grid-cols-2" },
+              React.createElement("div", null,
+                React.createElement("div", { className: "mb-2 text-sm font-semibold text-slate-700" }, "구체적 상황 · 공동 작성"),
+                React.createElement("textarea", {
+                  value: form.description,
+                  onChange: (e) => setForm({ ...form, description: e.target.value }),
+                  className: "min-h-[220px] w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none",
+                })
+              ),
+              React.createElement("div", null,
+                React.createElement("div", { className: "mb-2 text-sm font-semibold text-slate-700" }, "후속조치 · 공동 작성"),
+                React.createElement("textarea", {
+                  value: form.followUp,
+                  onChange: (e) => setForm({ ...form, followUp: e.target.value }),
+                  className: "min-h-[220px] w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none",
+                })
+              )
+            ),
+
+            React.createElement("div", { className: "mt-6" },
+              React.createElement("div", { className: "mb-2 text-sm font-semibold text-slate-700" }, "비고"),
+              React.createElement("textarea", {
+                value: form.note,
+                onChange: (e) => setForm({ ...form, note: e.target.value }),
+                className: "min-h-[120px] w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none",
+                placeholder: "필요한 경우만 입력",
+              })
+            ),
+
+            React.createElement("div", { className: "mt-6 flex justify-end gap-2" },
+              React.createElement("button", {
+                onClick: resetForm,
+                className: "rounded-2xl bg-slate-200 px-5 py-3 text-sm font-medium text-slate-700",
+              }, "초기화"),
+              React.createElement("button", {
+                onClick: saveIncident,
+                className: "rounded-2xl bg-slate-900 px-5 py-3 text-sm font-medium text-white",
+              }, editingId ? "수정 저장" : "사안 등록")
+            )
+          ) : null,
+
+          React.createElement("div", {
+            className: "fixed bottom-4 right-4 text-xs text-slate-400 pointer-events-none",
+          }, schoolSettings.footerText || "deploy ready version")
+        )
+      );
+    }
+
+    createRoot(document.getElementById("root")).render(React.createElement(App));
+  </script>
+</body>
+</html>
